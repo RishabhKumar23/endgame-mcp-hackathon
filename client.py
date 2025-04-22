@@ -1,218 +1,236 @@
-# Import necessary libraries
+"""
+MCP Client Application
+
+A professional interface for interacting with MCP servers using Google's Gemini AI.
+Handles tool discovery, function calling, and maintains a clean separation between:
+- Network communication
+- AI processing
+- User interface
+"""
+
 import asyncio
+import json
 import os
 import sys
-import json
-from typing import Optional
 from contextlib import AsyncExitStack
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+import colorama
+from colorama import Fore, Style
+from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from google.genai.types import Tool, FunctionDeclaration
-from dotenv import load_dotenv
-import colorama
-from colorama import Fore, Style, Back
+from google.genai.types import FunctionDeclaration, Tool
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 
-# Initialize colorama for cross-platform colored text
+# Initialize colorama
 colorama.init()
 
-# Define color scheme
-COLOR_SERVER = Fore.BLUE + Style.BRIGHT
-COLOR_TOOL_CALL = Fore.YELLOW
-COLOR_USER = Fore.GREEN
-COLOR_RESPONSE = Fore.CYAN
-COLOR_ERROR = Fore.RED
-COLOR_BORDER = Fore.MAGENTA
-RESET = Style.RESET_ALL
-
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
 
 
-def print_box(text: str, color: str = Fore.WHITE, title: Optional[str] = None):
-    """Print text in a styled box with optional title."""
-    lines = text.split("\n")
-    max_length = max(len(line) for line in lines)
+class MessageType(Enum):
+    """Classification for different message categories"""
 
-    if title:
-        title_line = f"[ {title} ]"
-        lines = [title_line] + ["─" * len(title_line)] + lines
-        max_length = max(max_length, len(title_line))
+    INFO = "INFO"
+    WARNING = "WARNING"
+    ERROR = "ERROR"
+    TOOL_CALL = "TOOL_CALL"
+    RESPONSE = "RESPONSE"
 
-    top = "╭" + "─" * (max_length + 2) + "╮"
-    bottom = "╰" + "─" * (max_length + 2) + "╯"
-    middle = "\n".join([f"│ {line.ljust(max_length)} │" for line in lines])
 
-    print(color + top)
-    print(middle)
-    print(bottom + RESET)
+@dataclass
+class ClientConfig:
+    """Configuration parameters for client behavior"""
+
+    gemini_model: str = "gemini-2.0-flash-001"
+    max_retries: int = 3
+    colors: Dict[MessageType, str] = field(
+        default_factory=lambda: {
+            MessageType.INFO: Fore.CYAN,
+            MessageType.WARNING: Fore.YELLOW,
+            MessageType.ERROR: Fore.RED,
+            MessageType.TOOL_CALL: Fore.MAGENTA,
+            MessageType.RESPONSE: Fore.GREEN,
+        }
+    )
+
+
+class DisplayManager:
+    """Handles all user-facing output with consistent styling"""
+
+    def __init__(self, config: ClientConfig):
+        self.config = config
+        self.line_length = 80
+
+    def _format_message(self, text: str, msg_type: MessageType) -> str:
+        """Apply consistent formatting based on message type"""
+        color = self.config.colors.get(msg_type, Fore.WHITE)
+        return f"{color}[{msg_type.value}] {text}{Style.RESET_ALL}"
+
+    def display(self, text: str, msg_type: MessageType = MessageType.INFO):
+        """Main display method with smart wrapping"""
+        wrapped_text = "\n".join(
+            text[i : i + self.line_length]
+            for i in range(0, len(text), self.line_length)
+        )  # Close the parenthesis here
+        print(self._format_message(wrapped_text, msg_type))
+
+    def display_tool_call(self, name: str, args: Dict[str, Any]):
+        """Specialized tool call display"""
+        header = f"Calling: {name}"
+        args_str = json.dumps(args, indent=2)
+        content = f"{header}\n{args_str}"
+        self.display(content, MessageType.TOOL_CALL)
 
 
 class MCPClient:
-    def __init__(self):
-        """Initialize the MCP client and configure the Gemini API."""
+    """Core client handling MCP server communication and AI integration"""
+
+    def __init__(self, config: ClientConfig):
+        self.config = config
+        self.display = DisplayManager(config)
         self.session: Optional[ClientSession] = None
         self.exit_stack = AsyncExitStack()
 
-        gemini_api_key = os.getenv("GEMINI_API_KEY")
-        if not gemini_api_key:
-            raise ValueError("GEMINI_API_KEY not found in .env file")
+        if not (api_key := os.getenv("GEMINI_API_KEY")):
+            raise EnvironmentError("GEMINI_API_KEY not found in environment variables")
+        self.ai_client = genai.Client(api_key=api_key)
 
-        self.genai_client = genai.Client(api_key=gemini_api_key)
+    async def connect(self, server_script: str):
+        """Establish connection to MCP server"""
+        try:
+            command = "python" if server_script.endswith(".py") else "node"
+            params = StdioServerParameters(command=command, args=[server_script])
 
-    async def connect_to_server(self, server_script_path: str):
-        """Connect to the MCP server and list available tools."""
-        command = "python" if server_script_path.endswith(".py") else "node"
-        server_params = StdioServerParameters(
-            command=command, args=[server_script_path]
-        )
+            async with stdio_client(params) as transport:
+                self.session = ClientSession(*transport)
+                await self.session.initialize()
 
-        stdio_transport = await self.exit_stack.enter_async_context(
-            stdio_client(server_params)
-        )
+                tools = (await self.session.list_tools()).tools
+                self.function_declarations = self._convert_tools(tools)
 
-        self.stdio, self.write = stdio_transport
-        self.session = await self.exit_stack.enter_async_context(
-            ClientSession(self.stdio, self.write)
-        )
+                self.display.display(
+                    f"Connected to server with {len(tools)} tools available",
+                    MessageType.INFO,
+                )
 
-        await self.session.initialize()
-        response = await self.session.list_tools()
-        tools = response.tools
+        except Exception as e:
+            self.display.display(f"Connection failed: {str(e)}", MessageType.ERROR)
+            raise
 
-        tool_list = ", ".join([tool.name for tool in tools])
-        print_box(
-            f"Connected successfully!\nAvailable tools: {tool_list}",
-            color=COLOR_SERVER,
-            title="Server Connection",
-        )
+    def _convert_tools(self, tools: List[Any]) -> List[Tool]:
+        """Convert MCP tools to Gemini-compatible format"""
+        return [
+            Tool(
+                function_declarations=[
+                    FunctionDeclaration(
+                        name=tool.name,
+                        description=tool.description,
+                        parameters=self._clean_schema(tool.inputSchema),
+                    )
+                ]
+            )
+            for tool in tools
+        ]
+
+    def _clean_schema(self, schema: Dict) -> Dict:
+        """Sanitize JSON schema for AI consumption"""
+
+        def recursive_clean(obj):
+            if isinstance(obj, dict):
+                obj.pop("title", None)
+                return {k: recursive_clean(v) for k, v in obj.items()}
+            return obj
+
+        return recursive_clean(schema)
 
     async def process_query(self, query: str) -> str:
-        """Process user query through Gemini with tool calling."""
-        user_prompt_content = types.Content(
-            role="user", parts=[types.Part.from_text(text=query)]
-        )
+        """Orchestrate the full query processing lifecycle"""
+        conversation = [types.Content(role="user", parts=[types.Part.from_text(query)])]
 
-        conversation = [user_prompt_content]
-        final_text = []
-
-        while True:
-            response = self.genai_client.models.generate_content(
-                model="gemini-2.0-flash-001",
-                contents=conversation,
-                config=types.GenerateContentConfig(tools=self.function_declarations),
-            )
-
-            function_calls = []
-            new_parts = []
-
-            for candidate in response.candidates:
-                if not candidate.content.parts:
-                    continue
-
-                for part in candidate.content.parts:
-                    if part.function_call:
-                        function_calls.append(part.function_call)
-                        new_parts.append(part)
-                    elif part.text:
-                        final_text.append(part.text)
-
-            if not function_calls:
-                break
-
-            for call_part, call in zip(new_parts, function_calls):
-                tool_name = call.name
-                tool_args = json.dumps(call.args, indent=2)
-                print_box(
-                    f"Tool: {tool_name}\nArguments:\n{tool_args}",
-                    color=COLOR_TOOL_CALL,
-                    title="Tool Call",
-                )
-
-                try:
-                    result = await self.session.call_tool(tool_name, call.args)
-                    function_response = {"result": result.content}
-                except Exception as e:
-                    function_response = {"error": str(e)}
-
-                function_response_part = types.Part.from_function_response(
-                    name=tool_name, response=function_response
-                )
-                tool_response_content = types.Content(
-                    role="tool", parts=[function_response_part]
-                )
-
-                conversation.append(call_part)
-                conversation.append(tool_response_content)
-
-        return "\n".join(final_text).strip()
-
-    async def chat_loop(self):
-        """Run an interactive chat session with the user."""
-        print_box(
-            "Type your queries below ('quit' to exit)",
-            COLOR_SERVER,
-            "MCP Client Started",
-        )
-
-        while True:
+        for attempt in range(self.config.max_retries):
             try:
-                query = input(f"{COLOR_USER}➤ Query: {RESET}").strip()
-                if query.lower() == "quit":
-                    break
+                response = self.ai_client.models.generate_content(
+                    model=self.config.gemini_model,
+                    contents=conversation,
+                    config=types.GenerateContentConfig(
+                        tools=self.function_declarations
+                    ),
+                )
+                return await self._handle_response(response, conversation)
+            except Exception as e:
+                if attempt == self.config.max_retries - 1:
+                    raise
+                self.display.display(
+                    f"Retrying... ({attempt+1}/{self.config.max_retries})",
+                    MessageType.WARNING,
+                )
 
-                response = await self.process_query(query)
-                print_box(response, COLOR_RESPONSE, "Response")
-            except KeyboardInterrupt:
-                print_box("Session terminated by user", COLOR_ERROR, "Warning")
-                break
+    async def _handle_response(self, response, conversation) -> str:
+        """Process AI response and handle tool calls"""
+        final_text = []
+        for candidate in response.candidates:
+            for part in candidate.content.parts:
+                if part.text:
+                    final_text.append(part.text)
+                elif part.function_call:
+                    result = await self._execute_tool_call(
+                        part.function_call, conversation
+                    )
+                    conversation.extend(result)
+        return "\n".join(final_text)
 
-    async def cleanup(self):
-        """Clean up resources before exiting."""
-        await self.exit_stack.aclose()
+    async def _execute_tool_call(self, call, conversation):
+        """Execute a single tool call and update conversation"""
+        self.display.display_tool_call(call.name, call.args)
 
-
-def clean_schema(schema):
-    """Recursively removes 'title' fields from JSON schema."""
-    if isinstance(schema, dict):
-        schema.pop("title", None)
-        if "properties" in schema:
-            for key in schema["properties"]:
-                schema["properties"][key] = clean_schema(schema["properties"][key])
-    return schema
-
-
-def convert_mcp_tools_to_gemini(mcp_tools):
-    """Converts MCP tools to Gemini-compatible format."""
-    gemini_tools = []
-    for tool in mcp_tools:
-        parameters = clean_schema(tool.inputSchema)
-        function_declaration = FunctionDeclaration(
-            name=tool.name,
-            description=tool.description,
-            parameters=parameters,
-        )
-        gemini_tools.append(Tool(function_declarations=[function_declaration]))
-    return gemini_tools
+        try:
+            result = await self.session.call_tool(call.name, call.args)
+            response_part = types.Part.from_function_response(
+                name=call.name, response={"result": result.content}
+            )
+            return [
+                types.Content(role="function", parts=[call]),
+                types.Content(role="tool", parts=[response_part]),
+            ]
+        except Exception as e:
+            self.display.display(f"Tool call failed: {str(e)}", MessageType.ERROR)
+            return []
 
 
 async def main():
-    """Main function to start the MCP client."""
-    if len(sys.argv) < 2:
-        print_box(
-            "Usage: python client.py <path_to_server_script>", COLOR_ERROR, "Error"
-        )
-        sys.exit(1)
+    """Application entry point"""
+    config = ClientConfig()
+    client = MCPClient(config)
 
-    client = MCPClient()
     try:
-        await client.connect_to_server(sys.argv[1])
-        await client.chat_loop()
-    except Exception as e:
-        print_box(str(e), COLOR_ERROR, "Error")
+        if len(sys.argv) < 2:
+            raise ValueError("Missing server script path")
+
+        await client.connect(sys.argv[1])
+
+        client.display.display(
+            "MCP Client ready. Type queries below ('exit' to quit)", MessageType.INFO
+        )
+
+        while (query := input(f"{Fore.WHITE}> ").strip().lower()) != "exit":
+            if not query:
+                continue
+            try:
+                response = await client.process_query(query)
+                client.display.display(response, MessageType.RESPONSE)
+            except Exception as e:
+                client.display.display(str(e), MessageType.ERROR)
+
+    except KeyboardInterrupt:
+        client.display.display("Session terminated", MessageType.INFO)
     finally:
-        await client.cleanup()
+        await client.exit_stack.aclose()
 
 
 if __name__ == "__main__":
