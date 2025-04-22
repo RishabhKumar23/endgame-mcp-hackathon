@@ -1,2 +1,0 @@
-#install everything from requirements file.
-pip install -r requirements.txt
